@@ -1,6 +1,6 @@
 // +build !windows
 
-package hosts
+package install
 
 import (
 	"bytes"

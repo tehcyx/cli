@@ -1,6 +1,6 @@
 // +build !windows
 // +build !darwin
 
-package hosts
+package install
 
 const hostsFile = "/etc/hosts"

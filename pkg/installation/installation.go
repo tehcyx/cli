@@ -85,59 +85,61 @@ func (i *Installation) InstallKyma() (*Result, error) {
 	if i.Options.CI || i.Options.NonInteractive {
 		i.Factory.NonInteractive = true
 	}
+
 	var err error
 	if i.k8s, err = kube.NewFromConfigWithTimeout("", i.Options.KubeconfigPath, i.Options.Timeout); err != nil {
 		return nil, pkgErrors.Wrap(err, "Could not initialize the Kubernetes client. Make sure your kubeconfig is valid")
 	}
 
-	s := i.newStep("Preparing installation")
-	// Checking existence of previous installation
-	prevInstallationState, kymaVersion, err := i.checkPrevInstallation()
+	s := i.newStep("Checking existence of previous installation")
+	prevInstallationState, err := i.checkPrevInstallation()
 	if err != nil {
 		s.Failure()
 		return nil, err
 	}
-	logInfo, err := i.getInstallationLogInfo(prevInstallationState, kymaVersion)
-	if err != nil {
-		s.Failure()
-		return nil, err
-	}
+	s.Successf("Existence of previous installation checked")
 
 	if prevInstallationState == installationSDK.NoInstallationState {
-		// Validating configurations
+		s = i.newStep("Validating configurations")
 		if err := i.validateConfigurations(); err != nil {
 			s.Failure()
 			return nil, err
 		}
+		s.Successf("Configurations validated")
 
-		// Checking installation source
-		i.checkInstallationSource()
+		s = i.newStep("Checking installation source")
+		if i.Options.fromLocalSources {
+			s.LogInfof("Installing Kyma from local path: '%s'", i.Options.LocalSrcPath)
+		} else {
+			if i.Options.releaseVersion != i.Options.configVersion {
+				s.LogInfof("Using the installation configuration from '%s'", i.Options.configVersion)
+			}
+			if i.Options.remoteImage != "" {
+				s.LogInfof("Installing Kyma with installer image '%s' ", i.Options.remoteImage)
+			} else {
+				s.LogInfof("Installing Kyma in version '%s' ", i.Options.releaseVersion)
+			}
+		}
+		s.Successf("Installation source checked")
 
-		// Loading installation files
+		s = i.newStep("Loading installation files")
 		files, err := i.prepareFiles()
 		if err != nil {
 			s.Failure()
 			return nil, err
 		}
+		s.Successf("Installation files loaded")
 
-		// Requesting Kyma Installer to install Kyma
-		if err := i.triggerInstallation(files); err != nil {
+		s = i.newStep("Requesting Kyma Installer to install Kyma")
+		if err := i.installInstaller(files); err != nil {
 			s.Failure()
 			return nil, err
 		}
-		s.Successf("Installation is ready")
-
-	} else {
-		s.Successf(logInfo)
+		s.Successf("Kyma Installer is installing Kyma")
 	}
 
 	if prevInstallationState != "Installed" && !i.Options.NoWait {
-		if prevInstallationState == installationSDK.NoInstallationState {
-			i.newStep("Waiting for installation to start")
-		} else {
-			i.newStep("Re-attaching installation status")
-		}
-		if err := i.waitForInstaller(); err != nil {
+		if err := i.waitForInstaller(prevInstallationState); err != nil {
 			return nil, err
 		}
 	}
@@ -150,11 +152,11 @@ func (i *Installation) InstallKyma() (*Result, error) {
 	return result, nil
 }
 
-func (i *Installation) checkPrevInstallation() (string, string, error) {
+func (i *Installation) checkPrevInstallation() (string, error) {
 	var err error
 	i.service, err = NewInstallationService(i.k8s.Config(), i.Options.Timeout, "")
 	if err != nil {
-		return "", "", fmt.Errorf("Failed to create installation service. Make sure your kubeconfig is valid: %s", err.Error())
+		return "", fmt.Errorf("Failed to create installation service. Make sure your kubeconfig is valid: %s", err.Error())
 	}
 
 	prevInstallationState, err := i.service.CheckInstallationState(i.k8s.Config())
@@ -163,7 +165,7 @@ func (i *Installation) checkPrevInstallation() (string, string, error) {
 		if errors.As(err, &installErr) {
 			prevInstallationState.State = "Error"
 		} else {
-			return "", "", fmt.Errorf("Failed to get installation state: %s", err.Error())
+			return "", fmt.Errorf("Failed to get installation state: %s", err.Error())
 		}
 	}
 
@@ -171,29 +173,24 @@ func (i *Installation) checkPrevInstallation() (string, string, error) {
 	if prevInstallationState.State != installationSDK.NoInstallationState {
 		kymaVersion, err = version.KymaVersion(i.Options.Verbose, i.k8s)
 		if err != nil {
-			return "", "", err
+			return "", err
 		}
 	}
 
-	return prevInstallationState.State, kymaVersion, nil
-}
-
-func (i *Installation) getInstallationLogInfo(prevInstallationState string, kymaVersion string) (string, error) {
-	var logInfo string
-	switch prevInstallationState {
+	switch prevInstallationState.State {
 	case "Installed":
-		logInfo = fmt.Sprintf("Kyma is already installed in version %s", kymaVersion)
+		i.currentStep.LogInfof("Kyma is already installed in version %s", kymaVersion)
 
 	case "InProgress", "Error":
 		// when installation is in in "Error" state, it doesn't mean that the installation has failed
 		// Installer might sill recover from the error and install Kyma successfully
-		logInfo = fmt.Sprintf("Installation in version %s is already in progress", kymaVersion)
+		i.currentStep.LogInfof("Installation in version %s is already in progress", kymaVersion)
 
 	case "":
-		return "", fmt.Errorf("Failed to get previous installation status")
+		return "", fmt.Errorf("Failed to get the installation status")
 	}
 
-	return logInfo, nil
+	return prevInstallationState.State, nil
 }
 
 func (i *Installation) validateConfigurations() error {
@@ -263,21 +260,6 @@ func (i *Installation) validateConfigurations() error {
 	return nil
 }
 
-func (i *Installation) checkInstallationSource() {
-	if i.Options.fromLocalSources {
-		i.currentStep.LogInfof("Installing Kyma from local path: '%s'", i.Options.LocalSrcPath)
-	} else {
-		if i.Options.releaseVersion != i.Options.configVersion {
-			i.currentStep.LogInfof("Using the installation configuration from '%s'", i.Options.configVersion)
-		}
-		if i.Options.remoteImage != "" {
-			i.currentStep.LogInfof("Installing Kyma with installer image '%s' ", i.Options.remoteImage)
-		} else {
-			i.currentStep.LogInfof("Installing Kyma in version '%s' ", i.Options.releaseVersion)
-		}
-	}
-}
-
 func (i *Installation) prepareFiles() (map[string]*File, error) {
 	files, err := i.loadInstallationFiles()
 	if err != nil {
@@ -310,7 +292,7 @@ func (i *Installation) prepareFiles() (map[string]*File, error) {
 	return files, nil
 }
 
-func (i *Installation) triggerInstallation(files map[string]*File) error {
+func (i *Installation) installInstaller(files map[string]*File) error {
 	componentList, err := i.loadComponentsConfig()
 	if err != nil {
 		return fmt.Errorf("Could not load components configuration file. Make sure file is a valid YAML and contains component list: %s", err.Error())
@@ -341,8 +323,14 @@ func (i *Installation) triggerInstallation(files map[string]*File) error {
 	return i.k8s.WaitPodStatusByLabel("kyma-installer", "name", "kyma-installer", corev1.PodRunning)
 }
 
-func (i *Installation) waitForInstaller() error {
+func (i *Installation) waitForInstaller(prevInstallationStatus string) error {
 	currentDesc := ""
+	if prevInstallationStatus == installationSDK.NoInstallationState {
+		i.newStep("Waiting for installation to start")
+	} else {
+		i.newStep("Re-attaching installation status")
+	}
+
 	var errorOccured bool
 	var timeout <-chan time.Time
 	if i.Options.Timeout > 0 {
